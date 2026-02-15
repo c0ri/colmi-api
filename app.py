@@ -21,7 +21,8 @@ load_dotenv()
 app = Flask(__name__)
 
 COLMI_ADDRESS = os.getenv("COLMI_ADDRESS", "")
-COLMI_TIMEOUT = int(os.getenv("COLMI_TIMEOUT", "30"))
+COLMI_BIN = os.getenv("COLMI_BIN", "/home/pi/.local/bin/colmi_r02_client")
+COLMI_TIMEOUT = int(os.getenv("COLMI_TIMEOUT", "45"))
 PORT = int(os.getenv("PORT", "8080"))
 
 # Simple in-memory cache to prevent concurrent BLE collisions
@@ -61,11 +62,12 @@ def run_colmi_command(subcommand: str, timeout: int | None = None) -> str | None
     if not COLMI_ADDRESS:
         return None
 
-    cmd = ["colmi_r02_client", f"--address={COLMI_ADDRESS}", *subcommand.split()]
+    cmd = [COLMI_BIN, f"--address={COLMI_ADDRESS}", *subcommand.split()]
     timeout = timeout or COLMI_TIMEOUT
 
     for attempt in range(2):
         try:
+            print(f"  ▶ Running: {' '.join(cmd)} (attempt {attempt + 1})")
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -73,13 +75,18 @@ def run_colmi_command(subcommand: str, timeout: int | None = None) -> str | None
                 timeout=timeout,
             )
             if result.returncode == 0 and result.stdout.strip():
+                print(f"  ✅ Output: {result.stdout.strip()[:120]}")
                 return result.stdout.strip()
+            if result.stderr.strip():
+                print(f"  ⚠️ stderr: {result.stderr.strip()[:120]}")
             if attempt == 0:
                 time.sleep(2)
         except subprocess.TimeoutExpired:
+            print(f"  ⏰ Timeout after {timeout}s")
             if attempt == 0:
                 time.sleep(2)
-        except Exception:
+        except Exception as e:
+            print(f"  ❌ Error: {e}")
             break
 
     return None
@@ -88,18 +95,24 @@ def run_colmi_command(subcommand: str, timeout: int | None = None) -> str | None
 def parse_values(output: str) -> list[int]:
     """Extract integer values from colmi_r02_client output.
 
-    The CLI outputs values in [value] format, e.g.:
-        Heart Rate: [72]
-        SpO2: [98]
+    The CLI outputs values like:
+        Starting reading, please wait.
+        [84, 83, 83, 83, 83, 80]
     """
+    # Match the list format [84, 83, 83, 83, 83, 80]
+    list_match = re.search(r"\[([0-9,\s]+)\]", output)
+    if list_match:
+        return [int(v.strip()) for v in list_match.group(1).split(",") if v.strip()]
+
+    # Fallback: individual [value] matches
     matches = re.findall(r"\[(\d+)\]", output)
     return [int(m) for m in matches]
 
 
-def parse_single_value(output: str) -> int | None:
-    """Extract a single integer value from CLI output."""
+def parse_last_value(output: str) -> int | None:
+    """Extract the last (most recent) value from CLI output."""
     values = parse_values(output)
-    return values[0] if values else None
+    return values[-1] if values else None
 
 
 def get_heart_rate() -> int | None:
@@ -107,7 +120,7 @@ def get_heart_rate() -> int | None:
     output = run_colmi_command("get-real-time heart-rate")
     if not output:
         return None
-    return parse_single_value(output)
+    return parse_last_value(output)
 
 
 def get_spo2() -> int | None:
@@ -115,15 +128,15 @@ def get_spo2() -> int | None:
     output = run_colmi_command("get-real-time spo2")
     if not output:
         return None
-    return parse_single_value(output)
+    return parse_last_value(output)
 
 
 def get_stress() -> int | None:
     """Get current stress level from the ring."""
-    output = run_colmi_command("get-real-time stress")
+    output = run_colmi_command("get-real-time pressure")
     if not output:
         return None
-    return parse_single_value(output)
+    return parse_last_value(output)
 
 
 def get_hrv() -> int | None:
@@ -131,15 +144,18 @@ def get_hrv() -> int | None:
     output = run_colmi_command("get-real-time hrv")
     if not output:
         return None
-    return parse_single_value(output)
+    return parse_last_value(output)
 
 
 def get_steps() -> int | None:
     """Get current step count."""
-    output = run_colmi_command("get-step-count")
+    output = run_colmi_command("get-steps")
     if not output:
         return None
-    return parse_single_value(output)
+    # get-steps may return "No results for day"
+    if "no results" in output.lower():
+        return 0
+    return parse_last_value(output)
 
 
 def get_battery() -> int | None:
@@ -225,4 +241,5 @@ if __name__ == "__main__":
         exit(1)
     print(f"Starting Colmi API on port {PORT}")
     print(f"Ring address: {COLMI_ADDRESS}")
+    print(f"CLI binary: {COLMI_BIN}")
     app.run(host="0.0.0.0", port=PORT)
