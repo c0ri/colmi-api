@@ -12,6 +12,11 @@ Lightweight HTTP server that wraps `colmi_r02_client` CLI calls for the Colmi R0
 
 ## Setup
 
+You need the colmi_r02_client.
+To install and use colmi_r02_client on Linux, use {Link: pipx https://tahnok.github.io/colmi_r02_client/} to install the Python package directly from GitHub, allowing you to scan for and interact with the Colmi R02 smart ring via Bluetooth. 
+
+Then go on with the install below:
+
 ```bash
 # On Raspberry Pi:
 cd /home/pi
