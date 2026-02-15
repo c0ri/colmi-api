@@ -1,0 +1,16 @@
+[Unit]
+Description=Colmi Ring HTTP API
+After=network.target bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/colmi-api
+EnvironmentFile=/home/pi/colmi-api/.env
+ExecStart=/home/pi/colmi-api/venv/bin/python app.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
