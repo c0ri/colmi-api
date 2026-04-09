@@ -8,6 +8,7 @@ Endpoints:
 
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -49,6 +50,42 @@ def _set_cached(key: str, data: dict) -> None:
         _cache[key] = {"data": data, "at": time.time()}
 
 
+def _ble_reconnect() -> bool:
+    """Ensure the ring is connected in BlueZ before bleak tries to use it.
+
+    Runs a short scan so BlueZ discovers the device, then connects.
+    Returns True if connection succeeded.
+    """
+    if not COLMI_ADDRESS:
+        return False
+    try:
+        # Brief scan so BlueZ sees the ring if it's advertising
+        subprocess.run(
+            ["bluetoothctl", "scan", "on"],
+            timeout=8,
+            capture_output=True,
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception as e:
+        print(f"  ⚠️ BLE scan error: {e}")
+
+    try:
+        result = subprocess.run(
+            ["bluetoothctl", "connect", COLMI_ADDRESS],
+            timeout=10,
+            capture_output=True,
+            text=True,
+        )
+        success = "Connection successful" in result.stdout
+        print(f"  {'✅' if success else '⚠️'} bluetoothctl connect: {result.stdout.strip()[:80]}")
+        return success
+    except Exception as e:
+        print(f"  ⚠️ bluetoothctl connect error: {e}")
+        return False
+
+
 def run_colmi_command(subcommand: str, timeout: int | None = None) -> str | None:
     """Run a colmi_r02_client CLI command and return stdout.
 
@@ -66,23 +103,38 @@ def run_colmi_command(subcommand: str, timeout: int | None = None) -> str | None
     timeout = timeout or COLMI_TIMEOUT
 
     for attempt in range(2):
+        proc = None
         try:
             print(f"  ▶ Running: {' '.join(cmd)} (attempt {attempt + 1})")
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
+                start_new_session=True,  # own process group so we can kill all children
             )
-            if result.returncode == 0 and result.stdout.strip():
-                print(f"  ✅ Output: {result.stdout.strip()[:120]}")
-                return result.stdout.strip()
-            if result.stderr.strip():
-                print(f"  ⚠️ stderr: {result.stderr.strip()[:120]}")
+            stdout, stderr = proc.communicate(timeout=timeout)
+            if proc.returncode == 0 and stdout.strip():
+                print(f"  ✅ Output: {stdout.strip()[:120]}")
+                return stdout.strip()
+            if stderr.strip():
+                err = stderr.strip()
+                print(f"  ⚠️ stderr: {err[:120]}")
+                # Ring not in BlueZ cache — scan and reconnect, then retry
+                if "BleakDeviceNotFoundError" in err and attempt == 0:
+                    print(f"  🔍 Device not found — reconnecting via bluetoothctl...")
+                    _ble_reconnect()
+                    continue  # retry immediately without sleep
             if attempt == 0:
                 time.sleep(2)
         except subprocess.TimeoutExpired:
             print(f"  ⏰ Timeout after {timeout}s")
+            if proc is not None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
             if attempt == 0:
                 time.sleep(2)
         except Exception as e:
