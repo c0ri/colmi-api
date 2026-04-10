@@ -52,6 +52,15 @@ def _get_cached(key: str) -> dict | None:
     return None
 
 
+def _get_cached_stale(key: str) -> dict | None:
+    """Return cached data regardless of age (used when ring is busy)."""
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and entry["data"]:
+            return entry["data"]
+    return None
+
+
 def _set_cached(key: str, data: dict) -> None:
     """Store data in cache."""
     with _cache_lock:
@@ -107,8 +116,12 @@ def run_colmi_command(subcommand: str, timeout: int | None = None) -> str | None
     cmd = [COLMI_BIN, f"--address={COLMI_ADDRESS}", *subcommand.split()]
     timeout = timeout or COLMI_TIMEOUT
 
-    with _ble_lock:
+    if not _ble_lock.acquire(blocking=False):
+        return None  # ring is busy; caller will use cache or return 503
+    try:
         return _run_colmi_command_locked(cmd, timeout)
+    finally:
+        _ble_lock.release()
 
 
 def _run_colmi_command_locked(cmd: list[str], timeout: int) -> str | None:
@@ -244,6 +257,10 @@ def heartrate():
 
     hr = get_heart_rate()
     if hr is None:
+        # Return stale cache rather than 503 if ring is busy or unavailable
+        stale = _get_cached_stale("heartrate")
+        if stale:
+            return jsonify(stale)
         return jsonify({"error": "Failed to read heart rate", "heart_rate": None}), 503
 
     data = {
@@ -260,6 +277,13 @@ def metrics():
     cached = _get_cached("metrics")
     if cached:
         return jsonify(cached)
+
+    # If ring is busy, return stale data rather than queuing a long BLE read
+    if _ble_lock.locked():
+        stale = _get_cached_stale("metrics")
+        if stale:
+            return jsonify(stale)
+        return jsonify({"error": "Ring busy", "heart_rate": None}), 503
 
     hr = get_heart_rate()
     spo2 = get_spo2()
