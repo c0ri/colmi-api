@@ -58,40 +58,37 @@ def _set_cached(key: str, data: dict) -> None:
         _cache[key] = {"data": data, "at": time.time()}
 
 
-def _ble_reconnect() -> bool:
-    """Ensure the ring is connected in BlueZ before bleak tries to use it.
+def _ble_disconnect() -> None:
+    """Disconnect the ring from BlueZ so it starts advertising for bleak."""
+    try:
+        subprocess.run(
+            ["bluetoothctl", "disconnect", COLMI_ADDRESS],
+            timeout=5,
+            capture_output=True,
+        )
+        time.sleep(3)  # wait for BlueZ to fully disconnect before bleak scans
+    except Exception as e:
+        print(f"  ⚠️ bluetoothctl disconnect error: {e}")
 
-    Runs a short scan so BlueZ discovers the device, then connects.
-    Returns True if connection succeeded.
+
+def _ble_wake_and_advertise() -> None:
+    """Wake a sleeping ring (via connect) then disconnect so it advertises for bleak.
+
+    For bonded devices BlueZ can initiate a connection even without advertising,
+    which wakes the ring. We then disconnect so it enters advertising mode.
     """
     if not COLMI_ADDRESS:
-        return False
+        return
+    print(f"  🔔 Waking ring via bluetoothctl connect...")
     try:
-        # Brief scan so BlueZ sees the ring if it's advertising
         subprocess.run(
-            ["bluetoothctl", "scan", "on"],
-            timeout=8,
-            capture_output=True,
-            start_new_session=True,
-        )
-    except subprocess.TimeoutExpired:
-        pass
-    except Exception as e:
-        print(f"  ⚠️ BLE scan error: {e}")
-
-    try:
-        result = subprocess.run(
             ["bluetoothctl", "connect", COLMI_ADDRESS],
-            timeout=10,
+            timeout=15,
             capture_output=True,
-            text=True,
         )
-        success = "Connection successful" in result.stdout
-        print(f"  {'✅' if success else '⚠️'} bluetoothctl connect: {result.stdout.strip()[:80]}")
-        return success
     except Exception as e:
         print(f"  ⚠️ bluetoothctl connect error: {e}")
-        return False
+    _ble_disconnect()
 
 
 def run_colmi_command(subcommand: str, timeout: int | None = None) -> str | None:
@@ -116,6 +113,10 @@ def run_colmi_command(subcommand: str, timeout: int | None = None) -> str | None
 
 def _run_colmi_command_locked(cmd: list[str], timeout: int) -> str | None:
     """Execute colmi command — must be called while holding _ble_lock."""
+    # Disconnect any active bluetoothctl connection so the ring starts advertising.
+    # Bleak requires the device to be advertising to find and connect to it.
+    _ble_disconnect()
+
     for attempt in range(2):
         proc = None
         try:
@@ -134,10 +135,9 @@ def _run_colmi_command_locked(cmd: list[str], timeout: int) -> str | None:
             if stderr.strip():
                 err = stderr.strip()
                 print(f"  ⚠️ stderr: {err[:120]}")
-                # Ring not in BlueZ cache — scan and reconnect, then retry
+                # Ring not advertising — wake it and retry
                 if "BleakDeviceNotFoundError" in err and attempt == 0:
-                    print(f"  🔍 Device not found — reconnecting via bluetoothctl...")
-                    _ble_reconnect()
+                    _ble_wake_and_advertise()
                     continue  # retry immediately without sleep
             if attempt == 0:
                 time.sleep(2)
