@@ -26,20 +26,28 @@ COLMI_BIN = os.getenv("COLMI_BIN", "/home/pi/.local/bin/colmi_r02_client")
 COLMI_TIMEOUT = int(os.getenv("COLMI_TIMEOUT", "45"))
 PORT = int(os.getenv("PORT", "8080"))
 
-# Simple in-memory cache to prevent concurrent BLE collisions
+# Cache TTLs — metrics is expensive (~1-2min of BLE), heartrate is cheap (~15s)
+CACHE_TTL = {
+    "heartrate": 20,
+    "metrics": 60,
+}
+
 _cache = {
     "heartrate": {"data": None, "at": 0.0},
     "metrics": {"data": None, "at": 0.0},
 }
 _cache_lock = threading.Lock()
-CACHE_TTL = 10  # seconds
+
+# Serializes all BLE operations — only one colmi_r02_client subprocess at a time
+_ble_lock = threading.Lock()
 
 
 def _get_cached(key: str) -> dict | None:
     """Return cached data if fresh enough."""
     with _cache_lock:
         entry = _cache.get(key)
-        if entry and entry["data"] and (time.time() - entry["at"]) < CACHE_TTL:
+        ttl = CACHE_TTL.get(key, 20)
+        if entry and entry["data"] and (time.time() - entry["at"]) < ttl:
             return entry["data"]
     return None
 
@@ -102,6 +110,12 @@ def run_colmi_command(subcommand: str, timeout: int | None = None) -> str | None
     cmd = [COLMI_BIN, f"--address={COLMI_ADDRESS}", *subcommand.split()]
     timeout = timeout or COLMI_TIMEOUT
 
+    with _ble_lock:
+        return _run_colmi_command_locked(cmd, timeout)
+
+
+def _run_colmi_command_locked(cmd: list[str], timeout: int) -> str | None:
+    """Execute colmi command — must be called while holding _ble_lock."""
     for attempt in range(2):
         proc = None
         try:
