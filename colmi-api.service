@@ -1,14 +1,13 @@
 [Unit]
-Description=Colmi Ring HTTP API
-After=network.target bluetooth.target bluetooth-autoconnect.service
-Wants=bluetooth.target
-Requires=bluetooth-autoconnect.service
+Description=Colmi Ring HTTP API (read-only, reads SQLite written by colmi-poller.service)
+After=network.target colmi-poller.service
 
 [Service]
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/code/colmi-api
 EnvironmentFile=/home/pi/code/colmi-api/.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/pi/code/colmi-api/.venv/bin/python app.py
 Restart=on-failure
 RestartSec=10

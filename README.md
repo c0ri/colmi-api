@@ -1,14 +1,35 @@
 # Colmi Ring HTTP API
 
-Lightweight HTTP server that wraps `colmi_r02_client` CLI calls for the Colmi R02/R06 smart rings. Provides endpoints for bot's biometric polling service.
+Two systemd services for the Colmi R02/R06 smart ring:
+
+- **`colmi-poller.service`** — background loop, the *sole* owner of the BLE connection.
+  Polls the ring every `POLL_INTERVAL_SEC` (default 60s) and writes each reading to a
+  local SQLite database (`data/colmi.db`). Feeds systemd's watchdog on loop liveness,
+  independent of whether the ring itself answered that cycle.
+- **`colmi-api.service`** — read-only Flask API. Never touches BLE; every request is a
+  single-digit-millisecond SQLite read of the latest row the poller wrote.
+
+This split exists because the previous request-driven design (each HTTP request
+triggering a live BLE read) had multiple callers — the systemd watchdog and Evelyn's
+Celery poller — contending for the ring's single BLE connection slot, which caused
+`BleakDBusError: br-connection-canceled` / `Operation already in progress` failures.
+With the poller as sole BLE owner and the API purely reading a cache-of-record, there's
+nothing left to contend over. The pre-redesign implementation is preserved at git tag
+`pre-poll-loop-redesign`.
 
 ## Endpoints
 
-| Endpoint | Description | Response Time |
-|---|---|---|
-| `GET /heartrate` | Heart rate only | ~15s |
-| `GET /metrics` | Full sensor suite (HR, SpO2, stress, HRV, steps, battery) | ~1-2min |
-| `GET /health` | Ring connectivity check | ~5s |
+All endpoints read from SQLite — no BLE call happens on request, so these respond in
+single-digit milliseconds. Every response includes `age_seconds` and `stale` so callers
+can tell "ring's fine, data's just a bit old" from "ring's been unreachable for a while"
+(`stale: true` once a reading is older than `STALE_AFTER_SEC`, default 3x the poll interval).
+
+| Endpoint | Description |
+|---|---|
+| `GET /latest` | Full latest reading (HR, SpO2, stress, HRV, steps, battery) |
+| `GET /heartrate` | Heart rate only, same freshness fields |
+| `GET /metrics` | Alias for `/latest` (kept for backwards compatibility) |
+| `GET /health` | **Poller** liveness (last cycle time/success) — not ring connectivity |
 
 ## Setup
 
@@ -36,16 +57,17 @@ python app.py
 curl http://localhost:8080/health
 ```
 
-## Systemd Service
+## Systemd Services
 
 ```bash
-sudo cp colmi-api.service /etc/systemd/system/
+sudo cp colmi-poller.service colmi-api.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable colmi-api
-sudo systemctl start colmi-api
+sudo systemctl enable --now colmi-poller
+sudo systemctl enable --now colmi-api
 
 # Check status
-sudo systemctl status colmi-api
+sudo systemctl status colmi-poller colmi-api
+sudo journalctl -u colmi-poller -f
 sudo journalctl -u colmi-api -f
 ```
 
@@ -57,6 +79,7 @@ COLMI_API_URL=http://<pi-ip>:8080
 BIOMETRICS_ENABLED=true
 ```
 
-## Caching
-
-Responses are cached in-memory for 10 seconds to prevent concurrent BLE collisions. Multiple requests within the cache window return the same reading instantly.
+Evelyn (or anything else) can poll `/latest` or `/heartrate` on whatever cadence it
+wants — there's no BLE contention risk anymore since the API never touches the ring.
+The old fast/slow adaptive poll-interval logic on Evelyn's side is no longer needed for
+this reason; it can just read on a fixed interval and check `stale`.

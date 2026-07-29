@@ -1,0 +1,73 @@
+# Roadmap
+
+## 2026-07-29 — Poll-loop redesign (done)
+
+**Problem:** the old design triggered a live BLE read against the ring on
+every HTTP request. Two independent pollers — the Pi's own `service-watchdog`
+health check and Evelyn's Celery-driven biometrics polling — both hit the API
+on their own schedules, and both ended up contending for the ring's single
+BLE connection slot. That contention surfaced as `BleakDBusError:
+br-connection-canceled` / `Operation already in progress` failures. A
+separate bug on Evelyn's side (throttle logic keyed off last *successful*
+reading instead of last *attempt*) meant a single failed poll would disable
+her backoff entirely, turning what should've been a 10-minute polling
+interval into a 30-second retry storm — which made the contention much worse
+in practice, though it wasn't the root cause.
+
+**Fix:** split into two services with a hard ownership boundary.
+
+- `colmi-poller.service` — the *only* process that ever opens a BLE
+  connection to the ring. Runs a fixed-interval loop (`POLL_INTERVAL_SEC`,
+  default 60s), reads whatever sensors respond, and writes the result to
+  SQLite (`data/colmi.db`).
+- `colmi-api.service` — read-only Flask API. Every endpoint is a single
+  `SELECT ... ORDER BY recorded_at DESC LIMIT 1` — no BLE call on the request
+  path, so responses are single-digit milliseconds regardless of how many
+  clients poll or how often.
+
+Callers (Evelyn or anything else) can now poll on whatever cadence they
+want — there's nothing left to contend over, since the API never touches the
+ring.
+
+**Two bugs found and fixed during the build, not part of the original plan:**
+
+1. `NOTIFY_SOCKET` leaked into the `colmi_r02_client` subprocess (inherited
+   via `subprocess.Popen`'s default env passthrough). Its own dependency
+   stack (anyio/asyncclick) sent a `STOPPING=1` systemd notification on
+   normal exit, which — since `NotifyAccess=all` — systemd accepted as *our*
+   service stopping, and killed the poll loop after every single metric
+   read.
+2. Even after fixing (1), `Type=notify` + `WatchdogSec` remained unreliable
+   with this subprocess-forking pattern (repeated `deactivating
+   (stop-sigterm)` cycling for reasons never fully root-caused past that
+   point). Isolated via an A/B test against `Type=simple`, which came back
+   immediately stable (0 restarts vs. constant crash-looping). Dropped the
+   systemd watchdog integration entirely — liveness is tracked via
+   `db.record_cycle()` and surfaced through `GET /health` instead, which is
+   externally inspectable and doesn't depend on systemd's notify-socket
+   semantics at all.
+
+Pre-redesign (request-driven) implementation is preserved at git tag
+`pre-poll-loop-redesign`.
+
+## Open follow-ups
+
+- **Evelyn-side response parsing.** `/heartrate` and `/metrics` dropped the
+  old `"timestamp"` field in favor of `"recorded_at"` + `"age_seconds"` +
+  `"stale"`. `/health`'s meaning changed entirely — it now reports poller
+  liveness, not ring BLE connectivity. Evelyn's parsing code needs a small
+  update to match (or the API needs a backward-compat `"timestamp"` alias —
+  not yet decided which).
+- **`hrv` and `steps` come back `null` most cycles.** Pre-existing behavior,
+  not a regression from this redesign — `hrv` reads frequently fail/timeout
+  against this ring, and `get-steps`' table-formatted output doesn't match
+  the bracket-list regex the other real-time reads use. Worth a proper look
+  if steps/HRV data actually matters downstream.
+- **No reading history/trends yet.** `readings` is append-only and already
+  supports it, but nothing queries anything but the latest row. Fine for
+  Evelyn's current use case; revisit if trend data becomes useful.
+- **Poll interval / cadence not yet soak-tested long-term.** Stability
+  confirmed over the short term (multiple clean cycles, 0 restarts) but not
+  over a multi-day run. Worth revisiting `POLL_INTERVAL_SEC`/
+  `STALE_AFTER_SEC` defaults once there's real-world signal on ring
+  reliability over longer stretches.

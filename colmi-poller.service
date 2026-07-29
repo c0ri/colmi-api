@@ -1,0 +1,18 @@
+[Unit]
+Description=Colmi Ring BLE Poll Loop (sole BLE owner)
+After=network.target bluetooth.target bluetooth-autoconnect.service
+Wants=bluetooth.target
+Requires=bluetooth-autoconnect.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/code/colmi-api
+EnvironmentFile=/home/pi/code/colmi-api/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/pi/code/colmi-api/.venv/bin/python poller.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
