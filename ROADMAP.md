@@ -66,8 +66,15 @@ Pre-redesign (request-driven) implementation is preserved at git tag
 - **No reading history/trends yet.** `readings` is append-only and already
   supports it, but nothing queries anything but the latest row. Fine for
   Evelyn's current use case; revisit if trend data becomes useful.
-- **Poll interval / cadence not yet soak-tested long-term.** Stability
-  confirmed over the short term (multiple clean cycles, 0 restarts) but not
-  over a multi-day run. Worth revisiting `POLL_INTERVAL_SEC`/
-  `STALE_AFTER_SEC` defaults once there's real-world signal on ring
-  reliability over longer stretches.
+- **Actual poll cycle time regularly exceeds `POLL_INTERVAL_SEC` by 3-5x.**
+  Confirmed 2026-07-29: `POLL_INTERVAL_SEC=60`, but real gaps between
+  successful `💾 Stored reading` writes in the poller log were consistently
+  3-4.5 minutes, not ~60s. Cause: nearly every cycle hits one or more
+  `⏰ Timeout after 45s` on individual metric reads (up to 2 attempts × 45s ×
+  6 metrics sequentially = up to 9 min worst case for one cycle), which
+  suggests the ring/BLE link is flakier than the polling design assumed.
+  Band-aided for now by bumping `STALE_AFTER_SEC` from 180s to 900s (15min)
+  so Evelyn stops seeing spurious `stale: true` — but the underlying
+  cause (why do individual `get-real-time` reads time out so often) hasn't
+  been investigated. Revisit if staleness becomes a problem again at the
+  900s threshold, or if the slow cycle time itself starts to matter.
