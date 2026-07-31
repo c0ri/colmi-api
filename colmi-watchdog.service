@@ -1,0 +1,10 @@
+[Unit]
+Description=Watchdog for the Colmi ring pipeline (data-freshness + bluetoothd-wedge recovery)
+After=colmi-api.service colmi-poller.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/home/pi/bin/colmi-watchdog.sh
+StandardOutput=journal
+StandardError=journal

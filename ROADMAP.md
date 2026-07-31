@@ -1,5 +1,30 @@
 # Roadmap
 
+## 2026-07-31 — bluetoothd wedge incident + colmi-watchdog rework (done)
+
+**Problem:** ring was off-wrist charging; `colmi-poller`'s connect/disconnect retry
+loop (2 attempts × 45s × 6 metrics per cycle, repeated every cycle) against an
+unreachable device wedged `bluetoothd`'s D-Bus interface — the process stayed
+"running" but every `bluetoothctl`/D-Bus call started timing out or returning
+"No default controller available". Went unnoticed for 7+ hours because `/health`
+only tracks "is the poll loop still ticking" (`db.record_cycle()` fires on
+failed cycles too), so it kept reporting `poller_alive: true` throughout. The
+old `service-watchdog.timer` also didn't help — it checked the same
+loop-liveness signal and, even on a real failure, only ever restarted
+`colmi-api.service`, which was never the broken piece.
+
+**Fix:**
+1. Manual recovery: `stop colmi-poller` → `restart bluetooth.service` →
+   `start colmi-poller`. Documented as a repeatable procedure in
+   `~/.claude/skills/colmi-recover/SKILL.md`.
+2. Replaced `service-watchdog.timer` (which also covered `qiui-ble`, an
+   unrelated service with a different failure/recovery model) with a
+   dedicated `colmi-watchdog.timer`. It checks `/latest`'s `age_seconds`
+   instead of `/health`, and only acts when data is stale *and*
+   `bluetoothctl show` confirms bluetoothd is actually wedged — avoids
+   false-triggering on the ring simply being out of range, which the poller
+   already retries on its own. See `colmi-watchdog.sh` / `README.md`.
+
 ## 2026-07-29 — Poll-loop redesign (done)
 
 **Problem:** the old design triggered a live BLE read against the ring on
