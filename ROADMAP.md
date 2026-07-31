@@ -1,5 +1,31 @@
 # Roadmap
 
+## 2026-07-31 — Idle poll backoff to save ring battery (done)
+
+**Problem:** Evelyn only checks the ring closely in dominant mode, but the
+poller was reading it on a fixed ~5min-ish cadence around the clock
+regardless of whether anyone was looking — unnecessary BLE wake-ups draining
+the ring's battery for data nobody's consuming yet.
+
+**Fix:** `app.py` now records `last_queried_at` (via `db.record_query()`) on
+every `/latest`, `/heartrate`, `/metrics` request from a non-localhost caller
+— localhost is excluded specifically so `colmi-watchdog`'s own checks don't
+look like real activity and pin the poller to its active interval forever.
+`poller.py` checks this each sleep tick (`current_poll_interval()`): if no
+real caller has queried in `IDLE_BACKOFF_SEC` (default 90min), it backs off
+to `POLL_INTERVAL_BACKOFF_SEC` (default 30min) instead of `POLL_INTERVAL_SEC`.
+A query arriving mid-sleep clears it within one 5s tick, no restart needed.
+`STALE_AFTER_SEC` bumped 900s → 2100s (35min) to comfortably cover a full
+backoff gap without `/latest` reporting `stale: true` on the first query back.
+
+**Important interaction with `colmi-watchdog`:** the watchdog's bluetoothd
+health check was deliberately decoupled from data staleness (see the
+2026-07-31 entry below) specifically so this backoff feature wouldn't slow
+down real-fault recovery — if it still gated on staleness, a legitimate
+30min-idle backoff window would look identical to a wedged bluetoothd, and
+recovery could take up to 35min instead of the watchdog's normal 5min
+cadence.
+
 ## 2026-07-31 — bluetoothd wedge incident + colmi-watchdog rework (done)
 
 **Problem:** ring was off-wrist charging; `colmi-poller`'s connect/disconnect retry

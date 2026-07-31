@@ -14,7 +14,7 @@ import os
 import time
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 import db
 
@@ -27,7 +27,18 @@ STALE_AFTER_SEC = int(os.getenv("STALE_AFTER_SEC", str(POLL_INTERVAL_SEC * 3)))
 app = Flask(__name__)
 
 
+def _maybe_record_query() -> None:
+    """Track real callers (Evelyn/BOT) for the poller's idle-backoff decision.
+
+    Excludes localhost so colmi-watchdog's own /latest checks don't look like
+    activity and keep the poller pinned to its active interval forever.
+    """
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        db.record_query()
+
+
 def _reading_response() -> dict:
+    _maybe_record_query()
     reading = db.get_latest_reading()
     if not reading:
         return {"error": "no readings yet", "stale": True}
@@ -79,12 +90,15 @@ def health():
 
     since_last_cycle = time.time() - state["last_cycle_at"]
     poller_alive = since_last_cycle < STALE_AFTER_SEC
+    last_queried_at = state.get("last_queried_at")
     return jsonify({
         "status": "ok" if poller_alive else "poller_stalled",
         "poller_alive": poller_alive,
         "seconds_since_last_cycle": int(since_last_cycle),
         "last_cycle_ok": bool(state["last_cycle_ok"]) if state["last_cycle_ok"] is not None else None,
         "last_error": state["last_error"],
+        "poll_interval_sec": state.get("poll_interval_sec"),
+        "seconds_since_last_query": int(time.time() - last_queried_at) if last_queried_at else None,
     }), 200 if poller_alive else 503
 
 

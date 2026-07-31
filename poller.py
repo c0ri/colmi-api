@@ -30,6 +30,13 @@ COLMI_BIN = os.getenv("COLMI_BIN", "/home/pi/.local/bin/colmi_r02_client")
 COLMI_TIMEOUT = int(os.getenv("COLMI_TIMEOUT", "45"))
 POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "60"))
 
+# Idle backoff: nobody's actually looking at the data (Evelyn's not in
+# dominant mode), so poll less often to save the ring's battery. Any real
+# caller (see app.py's _maybe_record_query — excludes the watchdog) clears
+# this immediately; the poller notices within one 5s sleep tick.
+IDLE_BACKOFF_SEC = int(os.getenv("IDLE_BACKOFF_SEC", str(90 * 60)))
+POLL_INTERVAL_BACKOFF_SEC = int(os.getenv("POLL_INTERVAL_BACKOFF_SEC", str(30 * 60)))
+
 _shutdown = False
 
 
@@ -144,6 +151,15 @@ def read_battery() -> int | None:
     return int(match.group(1)) if match else None
 
 
+def current_poll_interval() -> int:
+    last_queried_at = db.get_last_queried_at()
+    if last_queried_at is None:
+        return POLL_INTERVAL_SEC
+    if time.time() - last_queried_at > IDLE_BACKOFF_SEC:
+        return POLL_INTERVAL_BACKOFF_SEC
+    return POLL_INTERVAL_SEC
+
+
 def run_cycle() -> None:
     heart_rate = spo2 = stress = hrv = steps = battery = None
 
@@ -163,16 +179,21 @@ def run_cycle() -> None:
     got_anything = any(
         v is not None for v in (heart_rate, spo2, stress, hrv, steps, battery)
     )
+    next_interval = current_poll_interval()
     if got_anything:
         db.insert_reading(heart_rate, spo2, stress, hrv, steps, battery)
-        db.record_cycle(ok=True)
+        db.record_cycle(ok=True, poll_interval_sec=next_interval)
         print(
             f"  💾 Stored reading: hr={heart_rate} spo2={spo2} stress={stress} "
             f"hrv={hrv} steps={steps} battery={battery}",
             flush=True,
         )
     else:
-        db.record_cycle(ok=False, error="ring unreachable — no sensors returned data")
+        db.record_cycle(
+            ok=False,
+            error="ring unreachable — no sensors returned data",
+            poll_interval_sec=next_interval,
+        )
         print("  ⚠️ Cycle produced no data — ring unreachable", flush=True)
 
 
@@ -182,21 +203,34 @@ def main() -> None:
         sys.exit(1)
 
     db.init_db()
-    print(f"Colmi poller starting. address={COLMI_ADDRESS} interval={POLL_INTERVAL_SEC}s", flush=True)
+    print(
+        f"Colmi poller starting. address={COLMI_ADDRESS} interval={POLL_INTERVAL_SEC}s "
+        f"backoff_interval={POLL_INTERVAL_BACKOFF_SEC}s after {IDLE_BACKOFF_SEC}s idle",
+        flush=True,
+    )
 
+    last_logged_interval = None
     while not _shutdown:
         cycle_start = time.time()
         try:
             run_cycle()
         except Exception as e:
             print(f"  ❌ Unhandled cycle error: {e}", flush=True)
-            db.record_cycle(ok=False, error=str(e))
+            db.record_cycle(ok=False, error=str(e), poll_interval_sec=current_poll_interval())
 
-        elapsed = time.time() - cycle_start
-        remaining = max(0.0, POLL_INTERVAL_SEC - elapsed)
-        deadline = time.time() + remaining
-        while not _shutdown and time.time() < deadline:
-            time.sleep(min(5.0, deadline - time.time()))
+        # Re-checked every tick (not fixed at cycle start) so a query arriving
+        # mid-sleep during backoff shortens the wait immediately, and idle
+        # time crossing the threshold mid-sleep extends it.
+        while not _shutdown:
+            target = current_poll_interval()
+            if target != last_logged_interval:
+                print(f"  ⏱ Poll interval: {target}s "
+                      f"({'backoff' if target == POLL_INTERVAL_BACKOFF_SEC else 'active'})", flush=True)
+                last_logged_interval = target
+            elapsed = time.time() - cycle_start
+            if elapsed >= target:
+                break
+            time.sleep(min(5.0, target - elapsed))
 
     print("Colmi poller shutting down.", flush=True)
 

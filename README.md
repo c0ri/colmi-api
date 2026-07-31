@@ -3,24 +3,30 @@
 Three systemd units for the Colmi R02/R06 smart ring:
 
 - **`colmi-poller.service`** — background loop, the *sole* owner of the BLE connection.
-  Polls the ring every `POLL_INTERVAL_SEC` (default 60s) and writes each reading to a
-  local SQLite database (`data/colmi.db`). Liveness is tracked via `db.record_cycle()`
-  and surfaced through `/health`, not a systemd watchdog — `Type=notify`/`WatchdogSec`
-  was tried and dropped (see `ROADMAP.md`) because `colmi_r02_client`'s own dependency
-  stack sent spurious `sd_notify` messages that got misread as the service stopping.
+  Polls the ring every `POLL_INTERVAL_SEC` (default 60s, real-world cycles often run
+  longer — see below) while a real caller has queried within `IDLE_BACKOFF_SEC` (default
+  90min), otherwise backs off to `POLL_INTERVAL_BACKOFF_SEC` (default 30min) to save the
+  ring's battery — see the 2026-07-31 idle-backoff entry in `ROADMAP.md`. Writes each
+  reading to a local SQLite database (`data/colmi.db`). Liveness is tracked via
+  `db.record_cycle()` and surfaced through `/health`, not a systemd watchdog —
+  `Type=notify`/`WatchdogSec` was tried and dropped (see `ROADMAP.md`) because
+  `colmi_r02_client`'s own dependency stack sent spurious `sd_notify` messages that got
+  misread as the service stopping.
 - **`colmi-api.service`** — read-only Flask API. Never touches BLE; every request is a
-  single-digit-millisecond SQLite read of the latest row the poller wrote.
-- **`colmi-watchdog.timer`** — runs `colmi-watchdog.sh` every 5 minutes. Checks
-  `/latest`'s `age_seconds`/`stale` (real data freshness, not just "is the loop still
-  ticking" — the loop keeps ticking even when every read fails). Only intervenes if data
-  is stale *and* `bluetoothd` itself is confirmed wedged (`bluetoothctl show` hangs or
-  reports "No default controller available") — a failure mode hit on 2026-07-31 where
-  the poller's own retry storm against an out-of-range ring left `bluetoothd`'s D-Bus
-  interface unresponsive for 7+ hours. Recovery: stop poller → restart `bluetooth.service`
-  → start poller. If bluetoothd is healthy but data's stale, it does nothing — that's
-  just the ring out of range/off-wrist, and the poller retries on its own. Doesn't touch
-  BLE directly, so it never competes with the poller for the ring's connection slot. Manual
-  version of this procedure: `~/.claude/skills/colmi-recover/SKILL.md`.
+  single-digit-millisecond SQLite read of the latest row the poller wrote. Also records
+  `last_queried_at` on every real (non-localhost) request to `/latest`, `/heartrate`, or
+  `/metrics` — that's what drives the poller's idle backoff above.
+- **`colmi-watchdog.timer`** — runs `colmi-watchdog.sh` every 5 minutes, checking
+  whether `bluetoothd` itself is wedged (`bluetoothctl show` hangs or reports "No default
+  controller available") — a failure mode hit on 2026-07-31 where the poller's own retry
+  storm against an out-of-range ring left `bluetoothd`'s D-Bus interface unresponsive for
+  7+ hours. This check runs **unconditionally on every tick, independent of data
+  staleness/backoff state** — deliberately, so a real bluetoothd fault still gets caught
+  within ~5min even during a legitimate 30min idle-backoff window (e.g. right after
+  reattaching a recharged ring). If wedged: stop poller → restart `bluetooth.service` →
+  start poller. Doesn't touch BLE directly, so it never competes with the poller for the
+  ring's connection slot. Manual version of this procedure:
+  `~/.claude/skills/colmi-recover/SKILL.md`.
 
 This split exists because the previous request-driven design (each HTTP request
 triggering a live BLE read) had multiple callers — the systemd watchdog and Evelyn's
