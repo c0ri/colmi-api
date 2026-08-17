@@ -1,5 +1,56 @@
 # Roadmap
 
+## 2026-08-17 — Collapse per-cycle BLE connections 6 → 1 (done)
+
+**Problem:** system `dbus-daemon` on peaktribe had leaked to ~4.65GB RSS +
+1.8GB swap after 19 days uptime, pushing the whole Pi to 358MB free. Traced
+(via `strace` on live `dbus-daemon` + journal counts, see
+`~/debian-dbus-leak.md`) to `run_cycle()` calling `read_metric()`/
+`read_battery()` once per sensor (heart-rate/spo2/pressure/hrv/steps/
+battery), each going through `run_colmi_command()` — a `bluetoothctl
+disconnect` + a brand-new `colmi_r02_client` CLI subprocess per metric,
+i.e. a fresh BLE connect/disconnect and a fresh `bluetoothd` "Adv Monitor
+app" registration on the system D-Bus bus, 6 times every cycle. Confirmed
+via git history that this pattern was introduced by the 2026-07-29
+poll-loop redesign below and had been running unnoticed for the entire
+19-day leak window (two prior boots of 50+ days each, before this
+redesign, had no equivalent issue).
+
+Built a 5-variant synthetic dbus-daemon reproducer to check whether this
+was actually a dbus-daemon bug before touching production code — all five
+came back negative even at 1000x+ the real churn volume (see
+`~/dbus-leak-repro/`), so this was never filed as a Debian bug. The git
+timeline correlation was strong enough on its own to justify fixing the
+churn regardless of whose bug it technically is.
+
+**Fix:** `poller.py` now uses `colmi_r02_client`'s async `Client` class
+directly (added as a real dependency — same pinned commit already running
+via `pipx` — instead of shelling out to its CLI) and opens **one** BLE
+connection per cycle, reading all six metrics through it before
+disconnecting. Reconnects on-demand only if the connection actually drops
+mid-cycle (this ring is occasionally flaky mid-session — an unconditional
+single connection wasn't reliable enough on its own, see live-test notes
+below), rather than reconnecting unconditionally per metric like before.
+Verified live against the real ring: a full cycle now produces exactly 1
+`Adv Monitor app` disconnect event in the bluetoothd journal instead of 6.
+
+Also fixes the "**`steps` comes back `null` most cycles**" open follow-up
+below as a side effect: the old regex-based CLI-output parser expected a
+bracketed number list, but `get-steps`' pretty-printed output is a pipe
+table with no brackets, so it silently never matched anything. Reading
+`client.get_steps()` directly now returns typed `SportDetail` objects;
+`steps` is stored as their sum for the day.
+
+Old subprocess/CLI-based implementation preserved at `poller.py.bak` for
+rollback.
+
+**Still open:** `hrv` still fails most cycles (times out against this
+ring specifically — genuine flakiness, not a parsing bug, degrades
+gracefully). Whether the churn fix actually slowed dbus-daemon's growth
+is unconfirmed as of this writing — a cron-based email alert
+(`~/bin/dbus-leak-alert.sh`, fires once per boot if dbus-daemon RSS
+crosses 1GB) is watching it going forward.
+
 ## 2026-07-31 — Idle poll backoff to save ring battery (done)
 
 **Problem:** Evelyn only checks the ring closely in dominant mode, but the
@@ -109,23 +160,19 @@ Pre-redesign (request-driven) implementation is preserved at git tag
   liveness, not ring BLE connectivity. Evelyn's parsing code needs a small
   update to match (or the API needs a backward-compat `"timestamp"` alias —
   not yet decided which).
-- **`hrv` and `steps` come back `null` most cycles.** Pre-existing behavior,
-  not a regression from this redesign — `hrv` reads frequently fail/timeout
-  against this ring, and `get-steps`' table-formatted output doesn't match
-  the bracket-list regex the other real-time reads use. Worth a proper look
-  if steps/HRV data actually matters downstream.
+- **`hrv` comes back `null` most cycles.** Still open as of 2026-08-17 —
+  genuine timeout against this ring, not a parsing bug (see that entry
+  above; `steps` was the same bucket but is now fixed). Worth a proper
+  look if HRV data actually matters downstream.
 - **No reading history/trends yet.** `readings` is append-only and already
   supports it, but nothing queries anything but the latest row. Fine for
   Evelyn's current use case; revisit if trend data becomes useful.
 - **Actual poll cycle time regularly exceeds `POLL_INTERVAL_SEC` by 3-5x.**
-  Confirmed 2026-07-29: `POLL_INTERVAL_SEC=60`, but real gaps between
-  successful `💾 Stored reading` writes in the poller log were consistently
-  3-4.5 minutes, not ~60s. Cause: nearly every cycle hits one or more
-  `⏰ Timeout after 45s` on individual metric reads (up to 2 attempts × 45s ×
-  6 metrics sequentially = up to 9 min worst case for one cycle), which
-  suggests the ring/BLE link is flakier than the polling design assumed.
-  Band-aided for now by bumping `STALE_AFTER_SEC` from 180s to 900s (15min)
-  so Evelyn stops seeing spurious `stale: true` — but the underlying
-  cause (why do individual `get-real-time` reads time out so often) hasn't
-  been investigated. Revisit if staleness becomes a problem again at the
-  900s threshold, or if the slow cycle time itself starts to matter.
+  Confirmed 2026-07-29, still true after the 2026-08-17 connection-count
+  fix above (that fix targeted D-Bus churn, not per-metric timeout
+  duration): individual real-time reads can each take up to ~40s
+  internally when the ring doesn't produce a valid sample quickly, and
+  with up to 4 real-time metrics per cycle that can stack to several
+  minutes even on a single connection. `STALE_AFTER_SEC` already bumped to
+  900s to absorb this. Revisit if it starts mattering again, e.g. by
+  reading real-time metrics concurrently instead of sequentially.

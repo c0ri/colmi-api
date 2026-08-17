@@ -1,2 +1,3 @@
 flask
 python-dotenv
+colmi_r02_client @ git+https://github.com/tahnok/colmi_r02_client@9966fcec60885e3c3864157d1b87107388bf4d69
